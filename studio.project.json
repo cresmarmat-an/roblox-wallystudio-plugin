@@ -1,0 +1,12 @@
+{
+	"name": "Wally Studio",
+	"tree": {
+        "$className": "DataModel",
+        "ServerScriptService": {
+            "$className": "ServerScriptService",
+            "Wally Studio": {
+                "$path": "src"
+            }
+        }
+	}
+}
