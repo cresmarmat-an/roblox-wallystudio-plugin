@@ -1,0 +1,150 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to release, for example v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish plugin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo 'Expected a version tag such as v1.0.0 or v1.0.0-rc.1.' >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install tools from rokit.toml
+        uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+        with:
+          version: v1.2.0
+
+      - name: Prepare changelog notes and verify version
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          version = os.environ['RELEASE_TAG'][1:]
+          constants = pathlib.Path('src/Modules/Config/Constants.lua').read_text()
+          match = re.search(r'Constants\.PLUGIN_VERSION\s*=\s*"([^"]+)"', constants)
+          if not match or match.group(1) != version:
+              raise SystemExit(f'Tag version {version} must match Constants.PLUGIN_VERSION.')
+
+          changelog = pathlib.Path('CHANGELOG.md').read_text()
+          section = re.search(
+              r'^## \[' + re.escape(version) + r'\][^\n]*\n(.*?)(?=^## |\Z)',
+              changelog,
+              re.MULTILINE | re.DOTALL,
+          )
+          if not section or not section.group(1).strip():
+              raise SystemExit(f'CHANGELOG.md needs a nonempty [{version}] section.')
+
+          pathlib.Path('build').mkdir(exist_ok=True)
+          pathlib.Path('build/release-notes.md').write_text(section.group(1).strip() + '\n')
+          PY
+
+      - name: Build plugin models
+        run: |
+          rojo --version
+          rojo build default.project.json --output build/WallyStudio.rbxm
+          rojo build default.project.json --output build/WallyStudio.rbxmx
+
+      - name: Verify plugin files and generate checksums
+        run: |
+          python3 - <<'PY'
+          import collections
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          binary = pathlib.Path('build/WallyStudio.rbxm').read_bytes()
+          if not binary.startswith(b'<roblox!\x89\xff\r\n\x1a\n'):
+              raise SystemExit('The binary plugin model has an invalid header.')
+
+          model = ET.parse('build/WallyStudio.rbxmx').getroot()
+          roots = model.findall('Item')
+          if len(roots) != 1 or roots[0].get('class') != 'Script':
+              raise SystemExit('Expected a standalone plugin Script, not a place file.')
+
+          scripts = [item for item in model.iter('Item') if item.get('class') in ('Script', 'ModuleScript', 'LocalScript')]
+          actual = collections.Counter(item.find("./Properties/*[@name='Source']").text or '' for item in scripts)
+          expected = collections.Counter(path.read_text() for path in pathlib.Path('src').rglob('*') if path.suffix in ('.lua', '.luau'))
+          if actual != expected:
+              raise SystemExit('Built script sources differ from the repository sources.')
+          print(f'Verified {len(scripts)} packaged scripts.')
+          PY
+          (cd build && sha256sum WallyStudio.rbxm WallyStudio.rbxmx > SHA256SUMS)
+
+      - name: Keep build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: WallyStudio-${{ steps.tag.outputs.tag }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/WallyStudio.rbxm
+            build/WallyStudio.rbxmx
+            build/SHA256SUMS
+            build/release-notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/wally-release.json"; then
+            if [[ "$(jq -r '.isDraft' "$RUNNER_TEMP/wally-release.json")" != 'true' ]]; then
+              echo 'This release is already published; leaving its assets unchanged.'
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "Wally Studio $RELEASE_TAG" --notes-file build/release-notes.md
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            build/WallyStudio.rbxm build/WallyStudio.rbxmx build/SHA256SUMS --clobber
+
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --notes-file build/release-notes.md \
+              --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --notes-file build/release-notes.md \
+              --draft=false --prerelease=false --latest
+          fi
