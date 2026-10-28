@@ -24,7 +24,7 @@ Constants.PLUGIN_ID = "WallyStudio"
 Constants.PLUGIN_VERSION = "1.0.0"
 
 -- The plugin's logo, shown on the toolbar button and the About card.
-Constants.PLUGIN_ICON = "rbxassetid://117468634008962"
+Constants.PLUGIN_ICON = "rbxassetid://90326243977151"
 
 --------------------------------------------------------------------------------------
 -- REGISTRY
